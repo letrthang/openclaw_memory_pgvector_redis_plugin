@@ -1,0 +1,1 @@
+# openclaw_memory_pgvector_redis_plugin
