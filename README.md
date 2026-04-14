@@ -131,14 +131,17 @@ Set the required environment variables. For Kubernetes, use Secrets and ConfigMa
 ```env
 DATABASE_URL=postgresql://user:pass@host:25061/db?sslmode=require
 REDIS_URL=rediss://user:pass@host:25061
-OPENAI_API_KEY=sk-...
+EMBEDDING_API_KEY=pa-...   # Voyage AI key (or OpenAI key if EMBEDDING_PROVIDER=openai)
 ```
 
 **Optional (defaults shown):**
 ```env
+EMBEDDING_PROVIDER=anthropic     # anthropic (Voyage AI), openai, or local
+EMBEDDING_MODEL=voyage-3         # Model name for the chosen provider
 TENANCY_NAME=COMPANY
 DB_TABLE_NAME=v1.openclaw_agent_memory
 REDIS_KEY_PREFIX=openclaw:memory
+LOG_LEVEL=info                   # debug, info, warn, error
 ```
 
 See [Plugin Configuration](#plugin-configuration) for full details on each parameter.
@@ -242,7 +245,7 @@ redis-cli KEYS "openclaw:memory:*"
 | 1 | pgvector extension enabled | ☐ |
 | 2 | Memory table + partitions + indexes created | ☐ |
 | 3 | Plugin installed (via [openclawdir.com](https://openclawdir.com/) or GitHub) | ☐ |
-| 4 | `DATABASE_URL`, `REDIS_URL`, `OPENAI_API_KEY` set | ☐ |
+| 4 | `DATABASE_URL`, `REDIS_URL`, `EMBEDDING_API_KEY` set | ☐ |
 | 5 | `openclaw.json` updated with `"memory": "memory-pgvector-redis"` | ☐ |
 | 6 | (Optional) FK constraint added | ☐ |
 | 7 | Bot started, startup log shows plugin initialized | ☐ |
@@ -650,10 +653,15 @@ The plugin accepts configuration parameters via environment variables. These all
 |---------------------|----------|---------|-------------|
 | `DATABASE_URL` | ✅ | — | PostgreSQL connection string |
 | `REDIS_URL` | ✅ | — | Redis connection string |
-| `OPENAI_API_KEY` | ✅ | — | For embedding generation (`text-embedding-3-small`) |
+| `EMBEDDING_API_KEY` | ✅ | — | API key for the embedding provider (Voyage AI, OpenAI, or local) |
+| `EMBEDDING_PROVIDER` | ❌ | `anthropic` | Embedding provider: `anthropic` (Voyage AI), `openai`, or `local` |
+| `EMBEDDING_MODEL` | ❌ | `voyage-3` | Model name for the chosen provider |
+| `EMBEDDING_BASE_URL` | ❌ | — | Required when `EMBEDDING_PROVIDER=local` (e.g., `http://localhost:11434/v1`) |
 | `TENANCY_NAME` | ❌ | `COMPANY` | Human-readable label for what `tenant_id` represents in this instance. Used in logs, error messages, and health checks. |
 | `REDIS_KEY_PREFIX` | ❌ | `openclaw:memory` | Redis key namespace prefix |
 | `DB_TABLE_NAME` | ❌ | `v1.openclaw_agent_memory` | Fully-qualified PostgreSQL table name (schema.table) |
+| `LOG_LEVEL` | ❌ | `info` | Log verbosity: `debug`, `info`, `warn`, `error` |
+| `MAX_CONTENT_LENGTH` | ❌ | `32000` | Max allowed content length (chars) for save/search operations |
 
 ### How The Three Config Params Work Together
 
@@ -701,8 +709,8 @@ The plugin does NOT use `TENANCY_NAME` in SQL queries or Redis keys — those us
 ```env
 DATABASE_URL=postgresql://user:pass@host:25061/db?sslmode=require
 REDIS_URL=rediss://user:pass@host:25061
-OPENAI_API_KEY=sk-...
-# TENANCY_NAME, DB_TABLE_NAME, and REDIS_KEY_PREFIX use defaults
+EMBEDDING_API_KEY=pa-...
+# EMBEDDING_PROVIDER, EMBEDDING_MODEL, TENANCY_NAME, DB_TABLE_NAME, and REDIS_KEY_PREFIX use defaults
 ```
 
 **Multi-instance deployment** (same infra, different entity types):
@@ -710,7 +718,7 @@ OPENAI_API_KEY=sk-...
 # === Company Bot ===
 DATABASE_URL=postgresql://user:pass@host:25061/db?sslmode=require
 REDIS_URL=rediss://user:pass@host:25061
-OPENAI_API_KEY=sk-...
+EMBEDDING_API_KEY=pa-...
 TENANCY_NAME=COMPANY
 DB_TABLE_NAME=v1.openclaw_agent_memory_company
 REDIS_KEY_PREFIX=thannong:company
@@ -718,7 +726,9 @@ REDIS_KEY_PREFIX=thannong:company
 # === Customer Portal Bot ===
 DATABASE_URL=postgresql://user:pass@host:25061/db?sslmode=require
 REDIS_URL=rediss://user:pass@host:25061
-OPENAI_API_KEY=sk-...
+EMBEDDING_API_KEY=pa-...
+EMBEDDING_PROVIDER=openai
+EMBEDDING_MODEL=text-embedding-3-small
 TENANCY_NAME=CUSTOMER
 DB_TABLE_NAME=v1.openclaw_agent_memory_customer
 REDIS_KEY_PREFIX=portal:customer

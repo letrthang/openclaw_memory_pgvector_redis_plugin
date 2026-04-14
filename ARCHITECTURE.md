@@ -115,8 +115,8 @@ memory_save(content, memory_type, tenant_id)
     │                     updated_date = NOW();
     │
     ├── [2] Normalize content (same 7-step pipeline as memory_search)
-    │       strip punctuation → trim → lowercase → remove accents
-    │       → collapse whitespace → SHA-256 → {normalizedHash}
+    │       strip punctuation → trim → lowercase → spell correction
+    │       → remove accents → collapse whitespace → SHA-256
     │
     ├── [3] Redis SET memory-type cache (SYNC — blocks until confirmed)
     │       Key depends on memory_type:
@@ -124,16 +124,13 @@ memory_save(content, memory_type, tenant_id)
     │       • daily_note → SET {prefix}:{tid}:daily:{date}  TTL 24h
     │       • session    → SET {prefix}:{tid}:session:{sid} TTL 1h
     │
-    ├── [4] Redis SET search cache (SYNC — pre-warm)
-    │       SET {prefix}:{tid}:search:{normalizedHash}  TTL 5m
-    │       (next memory_search for this content will be a cache HIT)
-    │
-    ├── [5] Redis DEL stale search cache (SYNC)
-    │       DEL {prefix}:{tid}:search:* EXCEPT the key written in [4]
+    ├── [4] Redis DEL stale search cache (SYNC — evict)
+    │       SCAN + DEL {prefix}:{tid}:search:*
     │       (old search results may reference outdated memory content)
+    │       Search cache is NOT pre-warmed here — repopulated on next search.
     │
-    └── [6] Async: Generate embedding (BACKGROUND)
-            Call OpenAI text-embedding-3-small API
+    └── [5] Async: Generate embedding (BACKGROUND)
+            Call embedding provider API (Voyage AI / OpenAI / local)
             UPDATE {table}
               SET embedding = $1::vector WHERE id = $2 AND tenant_id = $3
 ```
@@ -147,8 +144,8 @@ OpenClaw Agent wants to recall memory
 memory_search(query, tenant_id)
     │
     ├── [1] Normalize query (same 7-step pipeline as memory_save)
-    │       strip punctuation → trim → lowercase → remove accents
-    │       → collapse whitespace → SHA-256
+    │       strip punctuation → trim → lowercase → spell correction
+    │       → remove accents → collapse whitespace → SHA-256
     │       Example: " What is  Thần Nông AI ?" → sha256("what is than nong ai") → {hash}
     │
     ├── [2] Redis GET search cache
@@ -247,18 +244,15 @@ memory_save() execution order:
          ↓ success
     [3] Redis SET type key  ←── Update memory-type cache (sync)
          ↓ success
-    [4] Redis SET search    ←── Pre-warm search cache with normalized key (sync)
+    [4] Redis DEL search:*  ←── Evict ALL stale search cache for tenant (sync)
          ↓ success
-    [5] Redis DEL search:*  ←── Evict stale search cache EXCEPT [4] (sync)
-         ↓ success
-    [6] Async embedding     ←── Non-blocking (background)
+    [5] Async embedding     ←── Non-blocking (background)
 
 If [1] fails → abort, return error (nothing written anywhere)
-If [2] fails → normalization error — log and continue without search cache
+If [2] fails → normalization error — log and continue without search cache eviction
 If [3] fails → PostgreSQL has the data; Redis will miss, fallback works
-If [4] fails → search cache not pre-warmed; next search will miss → PG fallback
-If [5] fails → stale search results may persist for up to 5 min (TTL)
-If [6] fails → retry in next memory_save or background job
+If [4] fails → stale search results may persist for up to 5 min (TTL)
+If [5] fails → retry in next memory_save or background job
 ```
 
 ### 3.3 Consistency Model
@@ -304,7 +298,7 @@ Agent memory_search("remote work policy")
 
 | Event | Keys Invalidated | Reason |
 |-------|-----------------|--------|
-| `memory_save` (any type) | `{prefix}:{tid}:search:*` | New memory may change search results |
+| `memory_save` (any type) | `{prefix}:{tid}:search:*` (all evicted) | New memory may change search results — cache repopulated on next search |
 | `memory_save` (long_term) | `{prefix}:{tid}:long_term` | Content updated |
 | `memory_save` (daily_note) | `{prefix}:{tid}:daily:{date}` | Content updated |
 | Scheduler soft-deletes old daily notes | `{prefix}:{tid}:daily:{date}` + `search:*` | Stale data evicted |
@@ -320,12 +314,14 @@ Normalization Pipeline (7 steps, in order):
     Step 1: Strip punctuation    .?!,;:'"()[]{}
     Step 2: Trim whitespace      leading + trailing
     Step 3: Lowercase            all characters
-    Step 4: Remove accents       Vietnamese diacritics (ầ→a, ô→o, ồ→o, ứ→u, etc.)
-                                 Uses Unicode NFD decomposition + strip combining chars
-    Step 5: Spell correction     Fix common typos using local Hunspell dictionaries
+    Step 4: Spell correction     Fix common typos using local Hunspell dictionaries
                                  Dual-language: en_US + vi_VN (English + Vietnamese)
                                  "wht" → "what", "recieve" → "receive"
                                  No AI, no API calls — runs locally (~0.1ms/word)
+                                 ⚠ MUST run BEFORE accent removal — Vietnamese spell
+                                   checker needs accented text to work correctly
+    Step 5: Remove accents       Vietnamese diacritics (ầ→a, ô→o, ồ→o, ứ→u, etc.)
+                                 Uses Unicode NFD decomposition + strip combining chars
     Step 6: Collapse whitespace  multiple spaces → single space
     Step 7: SHA-256 hash         normalized string → {normalizedHash}
 ```
@@ -338,8 +334,8 @@ Input:   " Wht is   Thần Nông AI platform ?"
 Step 1:  strip punctuation  → " Wht is   Thần Nông AI platform "
 Step 2:  trim whitespace    → "Wht is   Thần Nông AI platform"
 Step 3:  lowercase          → "wht is   thần nông ai platform"
-Step 4:  remove accents     → "wht is   than nong ai platform"
-Step 5:  spell correction   → "what is   than nong ai platform"   ← "wht" → "what"
+Step 4:  spell correction   → "what is   thần nông ai platform"   ← "wht" → "what" (accents preserved for vi_VN check)
+Step 5:  remove accents     → "what is   than nong ai platform"
 Step 6:  collapse spaces    → "what is than nong ai platform"
 Step 7:  SHA-256            → "b7e9f2a1..."
 
@@ -376,7 +372,7 @@ Dual-language check (per word):
 Example:
   "wht"   → en: false, vi: false → en.suggest → "what" ✅
   "xin"   → en: false, vi: true  → keep "xin" ✅ (Vietnamese word)
-  "chao"  → en: false, vi: true  → keep "chao" ✅ (Vietnamese, accent stripped in step 4)
+  "chào"  → en: false, vi: true  → keep "chào" ✅ (Vietnamese, accents still present at step 4)
   "hello" → en: true             → keep "hello" ✅
 
 ~0.1ms per word. No network call. Both languages loaded at startup.
@@ -554,10 +550,15 @@ Pod Created (Deployment/Restart/Scale-up)
 |----------|--------|-------------|
 | `DATABASE_URL` | K8S Secret or `.env` | PostgreSQL connection string (read-write for memory table) |
 | `REDIS_URL` | K8S Secret or `.env` | Redis connection string (SSL recommended) |
-| `OPENAI_API_KEY` | K8S Secret or `.env` | For embedding generation (`text-embedding-3-small`) |
+| `EMBEDDING_API_KEY` | K8S Secret or `.env` | API key for the embedding provider (Voyage AI, OpenAI, or local) |
+| `EMBEDDING_PROVIDER` | K8S ConfigMap or `.env` | Embedding provider: `anthropic` (Voyage AI), `openai`, or `local` (default: `anthropic`) |
+| `EMBEDDING_MODEL` | K8S ConfigMap or `.env` | Model name for the chosen provider (default: `voyage-3`) |
+| `EMBEDDING_BASE_URL` | K8S ConfigMap or `.env` | Required when `EMBEDDING_PROVIDER=local` (e.g., `http://localhost:11434/v1`) |
 | `TENANCY_NAME` | K8S ConfigMap or `.env` | Human-readable label for what `tenant_id` represents (default: `COMPANY`). Used in logs, errors, and health checks — not in SQL or Redis keys. Examples: `COMPANY`, `CUSTOMER`, `USER`, `ORG`. |
-| `DB_TABLE_NAME` | K8S ConfigMap or `.env` | Fully-qualified PostgreSQL table name (default: `v1.openclaw_agent_memory`). Use unique values when sharing a database across multiple plugin instances. |
-| `REDIS_KEY_PREFIX` | K8S ConfigMap or `.env` | Redis key namespace prefix (default: `openclaw:memory`). Use unique values when sharing a Redis DB across multiple plugin instances. |
+| `DB_TABLE_NAME` | K8S ConfigMap or `.env` | Fully-qualified PostgreSQL table name (default: `v1.openclaw_agent_memory`). Validated as a safe SQL identifier. Use unique values when sharing a database across multiple plugin instances. |
+| `REDIS_KEY_PREFIX` | K8S ConfigMap or `.env` | Redis key namespace prefix (default: `openclaw:memory`). Validated as alphanumeric with colons/dots/hyphens/underscores. |
+| `LOG_LEVEL` | K8S ConfigMap or `.env` | Log verbosity: `debug`, `info`, `warn`, `error` (default: `info`) |
+| `MAX_CONTENT_LENGTH` | K8S ConfigMap or `.env` | Max allowed content length in chars for save/search (default: `32000`) |
 
 ---
 
@@ -611,7 +612,7 @@ CREATE TABLE v1.openclaw_agent_memory (
     tenant_id    varchar        NOT NULL,   -- HASH PARTITION KEY (opaque tenant isolation key)
     memory_type  varchar(50)    NOT NULL,   -- 'long_term', 'daily_note', 'session'
     content_text text           NOT NULL,   -- Raw memory content
-    embedding    vector(1536)   NOT NULL,   -- OpenAI text-embedding-3-small
+    embedding    vector,                    -- Untyped: supports any provider dimensions (512-3072)
     memory_date  date           NULL,       -- For daily_note only
     status       int4           NOT NULL DEFAULT 1,  -- 1=ACTIVE, 0=DELETED
     created_date timestamp      NOT NULL,
@@ -867,13 +868,22 @@ At extreme scale (>10M rows), consider:
 - Adding RANGE sub-partitioning on `created_date` for time-bounded pruning
 - Per-tenant partition (if a single tenant exceeds 1M memory rows)
 
-### 12.3 Embedding Model Migration
+### 12.3 Embedding Model / Provider Migration
 
-If the embedding model changes (e.g., to `text-embedding-3-large` with 3072 dimensions):
-1. Alter column: `ALTER TABLE ... ALTER COLUMN embedding TYPE vector(3072)`
-2. Re-embed all rows (batch job)
-3. REINDEX HNSW indexes on all partitions
-4. Update plugin config to use new model
+The `embedding` column uses untyped `vector` (no fixed dimension), so switching providers does **not** require a column ALTER. However, vectors of different dimensions cannot be compared via cosine distance:
+
+1. Update `EMBEDDING_PROVIDER` and `EMBEDDING_MODEL` env vars
+2. Re-embed all existing rows (batch job) — old vectors have incompatible dimensions
+3. REINDEX HNSW indexes on all partitions: `REINDEX INDEX CONCURRENTLY ...`
+4. The plugin validates dimensions at startup and warns if existing DB vectors don't match the new provider
+
+**Supported providers and dimensions:**
+
+| Provider | Models | Dimensions |
+|----------|--------|------------|
+| `anthropic` (Voyage AI) | `voyage-3`, `voyage-3-large`, `voyage-3-lite`, `voyage-code-3` | 512–1024 |
+| `openai` | `text-embedding-3-small`, `text-embedding-3-large` | 1536–3072 |
+| `local` | Any OpenAI-compatible (e.g., `nomic-embed-text`, Ollama, vLLM) | Varies (768 default) |
 
 ### 12.4 Read Replicas
 
