@@ -11,6 +11,8 @@
 
 ## Overview
 
+![OpenClaw Memory Plugin Architecture](docs/design/openclaw_memory_plugin_architecture.png)
+
 This project implements a **custom OpenClaw memory plugin** (`memory-pgvector-redis`) that replaces OpenClaw's default file-based memory system (`MEMORY.md`, daily notes `.md` files, and per-pod SQLite vector index) with a shared **PostgreSQL + Redis** backend.
 
 ### Why This Plugin Exists
@@ -57,13 +59,13 @@ This section describes how to deploy the `memory-pgvector-redis` plugin into an 
 
 ### Prerequisites
 
-| Requirement | Details |
-|-------------|---------|
-| **OpenClaw bot** | Running instance with plugin slot support. See [openclawdir.com](https://openclawdir.com/) for setup guides. |
-| **PostgreSQL 18+** | With `pgvector` extension enabled (`CREATE EXTENSION IF NOT EXISTS vector;`) |
-| **Redis 8+** | Managed or self-hosted, SSL recommended |
-| **Node.js 22+ LTS** | Plugin runtime |
-| **OpenAI API key** | For `text-embedding-3-small` embedding generation |
+| Requirement         | Details                                                                                                      |
+|---------------------|--------------------------------------------------------------------------------------------------------------|
+| **OpenClaw bot**    | Running instance with plugin slot support. See [openclawdir.com](https://openclawdir.com/) for setup guides. |
+| **PostgreSQL 18+**  | With `pgvector` extension enabled (`CREATE EXTENSION IF NOT EXISTS vector;`)                                 |
+| **Redis 8+**        | Managed or self-hosted, SSL recommended                                                                      |
+| **Node.js 22+ LTS** | Plugin runtime                                                                                               |
+| **LLM API key**     | For `Claude Haiku 4.5` or `localhost LLM` embedding generation                                                 |
 
 ### Step 1 — Create the Database Table
 
