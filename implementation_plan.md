@@ -2,7 +2,7 @@
 
 **Created**: 2026-04-14
 **Status**: Implementation in progress
-**Total files to create**: 29 (18 source + 1 SQL migration + 4 config + 6 test)
+**Total files to create**: 32 (21 source + 1 SQL migration + 4 config + 6 test)
 
 ---
 
@@ -36,7 +36,12 @@ openclaw_memory_pgvector_redis_plugin/
 │   │   ├── redisClient.ts
 │   │   └── cacheService.ts
 │   ├── embedding/
-│   │   └── openaiEmbedding.ts
+│   │   ├── embeddingService.ts
+│   │   ├── embeddingProvider.ts
+│   │   └── providers/
+│   │       ├── anthropicProvider.ts
+│   │       ├── openaiProvider.ts
+│   │       └── localProvider.ts
 │   ├── normalization/
 │   │   ├── pipeline.ts
 │   │   ├── spellCorrector.ts
@@ -82,7 +87,7 @@ openclaw_memory_pgvector_redis_plugin/
 | 3 | `src/config/env.ts`, `src/types/index.ts`, `src/utils/logger.ts`, `src/errors/pluginErrors.ts` | Core infrastructure layer |
 | 4 | `src/db/pool.ts`, `src/db/queries.ts` | PostgreSQL pool with retry + all SQL queries |
 | 5 | `src/cache/redisClient.ts`, `src/cache/cacheService.ts` | Redis client + cache service |
-| 6 | `src/normalization/pipeline.ts`, `src/normalization/accentRemover.ts`, `src/normalization/spellCorrector.ts`, `src/embedding/openaiEmbedding.ts` | Normalization pipeline + embedding |
+| 6 | `src/normalization/pipeline.ts`, `src/normalization/accentRemover.ts`, `src/normalization/spellCorrector.ts`, `src/embedding/embeddingProvider.ts`, `src/embedding/embeddingService.ts`, `src/embedding/providers/anthropicProvider.ts`, `src/embedding/providers/openaiProvider.ts`, `src/embedding/providers/localProvider.ts` | Normalization pipeline + multi-provider embedding |
 | 7 | `src/operations/memorySave.ts`, `src/operations/memorySearch.ts`, `src/operations/startupLoad.ts` | Three main operations |
 | 8 | `src/health/healthCheck.ts`, `src/index.ts` | Health check + plugin entry point |
 | 9 | `v1.openclaw_agent_memory.sql` | SQL migration |
@@ -144,7 +149,7 @@ openclaw_memory_pgvector_redis_plugin/
 **Purpose**: Documented environment variable template. Safe to commit (no real secrets).
 
 **What it does**:
-- Lists all 6 env vars with placeholder values and descriptive comments
+- Lists all 8 env vars with placeholder values and descriptive comments
 - Developers copy this to `.env` and fill in real values
 - `.env` is in `.gitignore`; `.env.example` is tracked
 
@@ -162,10 +167,13 @@ openclaw_memory_pgvector_redis_plugin/
 
 **What it does**:
 - Calls `dotenv.config()` to load `.env` file (dev only; in K8s, env vars come from Secrets/ConfigMaps)
-- Defines a Zod schema with all 6 env vars:
+- Defines a Zod schema with all 8 env vars:
   - `DATABASE_URL` (required, string, must start with `postgresql://` or `postgres://`)
   - `REDIS_URL` (required, string)
-  - `OPENAI_API_KEY` (required, string, must start with `sk-`)
+  - `EMBEDDING_PROVIDER` (optional, enum: `'anthropic' | 'openai' | 'local'`, defaults to `"anthropic"`)
+  - `EMBEDDING_API_KEY` (required, string — Anthropic API key, OpenAI API key, or local server token depending on provider)
+  - `EMBEDDING_MODEL` (optional, string, defaults to `"claude-haiku-4.5"` — see model table below)
+  - `EMBEDDING_BASE_URL` (optional, string — only used when `EMBEDDING_PROVIDER=local`, e.g., `http://localhost:11434/v1`)
   - `TENANCY_NAME` (optional, defaults to `"COMPANY"`)
   - `DB_TABLE_NAME` (optional, defaults to `"v1.openclaw_agent_memory"`)
   - `REDIS_KEY_PREFIX` (optional, defaults to `"openclaw:memory"`)
@@ -189,10 +197,11 @@ openclaw_memory_pgvector_redis_plugin/
 
 **What it does**:
 - Defines `MemoryType` enum: `'long_term' | 'daily_note' | 'session'`
+- Defines `EmbeddingProviderType` enum: `'anthropic' | 'openai' | 'local'`
 - Defines `MemoryRow` interface: matches the DB table columns (id, tenant_id, memory_type, content_text, embedding, memory_date, status, created_date, updated_date)
 - Defines `MemoryResult` interface: returned from `memory_search` (content_text, similarity score, memory_type, memory_date)
 - Defines `MemoryContext` interface: returned from `startup_load` (longTerm content, dailyNotes array, loaded-from indicator)
-- Defines `HealthResponse` interface: `{ plugin, version, tenancy, status, postgresql, redis }`
+- Defines `HealthResponse` interface: `{ plugin, version, tenancy, status, postgresql, redis, embedding }`
 - Defines operation parameter interfaces: `SaveParams`, `SearchParams`, `StartupParams`
 
 **Codeflow**: Not applicable (type definitions only, no runtime code).
@@ -232,7 +241,7 @@ openclaw_memory_pgvector_redis_plugin/
   - `ConfigError` — invalid env var, missing config
   - `DatabaseError` — PostgreSQL query/connection failure (includes `code`, `query`, `tenantId`)
   - `CacheError` — Redis operation failure (includes `operation`, `key`)
-  - `EmbeddingError` — OpenAI API failure (includes `statusCode`, `retryable`)
+  - `EmbeddingError` — Embedding provider API failure (includes `provider`, `statusCode`, `retryable`)
   - `NormalizationError` — normalization pipeline failure (includes `step`, `input`)
 - Each error class wraps the original error as `cause` (standard ES2022 `Error.cause`)
 - Exports helper function `isTransientPgError(err)`: checks error code against known transient codes (`ECONNREFUSED`, `ECONNRESET`, `57P01`, `57P03`, `08006`, `08001`, `08004`)
@@ -493,7 +502,7 @@ evictSearchCache(tenantId, exceptHash?):
 
 ---
 
-### Normalization & Embedding Layer (Step 6)
+### Normalization & Multi-Provider Embedding Layer (Step 6)
 
 ---
 
@@ -618,32 +627,230 @@ Step 7: SHA-256("what is than nong ai platform") = "b7e9f2a1..."
 
 ---
 
-#### `src/embedding/openaiEmbedding.ts`
+#### `src/embedding/embeddingProvider.ts`
 
-**Purpose**: Generate text embeddings via OpenAI API with retry for transient HTTP errors.
+**Purpose**: Defines the `EmbeddingProvider` interface — the contract that all embedding providers must implement. Enables swapping providers via config without changing any operation code.
 
 **What it does**:
-- Initializes OpenAI client with `OPENAI_API_KEY` from config
-- Exports `generateEmbedding(text: string): Promise<number[]>` — generates a 1536-dimension vector
-- Uses `text-embedding-3-small` model
-- Wraps the API call in retry logic: 2 attempts with 1s delay for HTTP 429 (rate limit), 500, 502, 503
+- Exports `EmbeddingProvider` interface with:
+  - `name: string` — provider identifier (e.g., `'anthropic'`, `'openai'`, `'local'`)
+  - `generateEmbedding(text: string): Promise<number[]>` — generate a single embedding vector
+  - `getDimensions(): number` — return the embedding dimensions (e.g., 1536)
+- Exports `EmbeddingProviderConfig` interface with:
+  - `provider: 'anthropic' | 'openai' | 'local'`
+  - `apiKey: string`
+  - `model: string`
+  - `baseUrl?: string` — only for `local` provider
+
+**Codeflow**: Not applicable (interface definitions only).
+
+**Supported provider/model matrix**:
+
+| Provider | Model | Dimensions | API Style | Notes |
+|----------|-------|-----------|-----------|-------|
+| `anthropic` | `claude-haiku-4.5` (default) | 1536 | Anthropic Messages API | Default provider. Cost-effective for embeddings. |
+| `anthropic` | `claude-sonnet-4.6` | 1536 | Anthropic Messages API | Higher quality, higher cost. Future upgrade path. |
+| `anthropic` | `claude-opus-4.6` | 1536 | Anthropic Messages API | Highest quality. For premium tenants. |
+| `openai` | `text-embedding-3-small` (default) | 1536 | OpenAI Embeddings API | Fallback / alternative provider. |
+| `openai` | `text-embedding-3-large` | 3072 | OpenAI Embeddings API | Higher quality OpenAI option. |
+| `local` | configurable (e.g., `nomic-embed-text`) | varies | OpenAI-compatible API | For on-prem, air-gapped, or cost-zero deployments. |
+
+---
+
+#### `src/embedding/providers/anthropicProvider.ts`
+
+**Purpose**: Embedding provider implementation using Anthropic Claude models (Haiku 4.5, Sonnet 4.6, Opus 4.6).
+
+**What it does**:
+- Implements `EmbeddingProvider` interface
+- Initializes Anthropic client with `EMBEDDING_API_KEY` from config
+- Uses `EMBEDDING_MODEL` from config (default: `claude-haiku-4.5`)
+- Calls Anthropic's embedding API to generate vectors
+- Wraps API call in retry logic: 2 attempts with 1s delay for HTTP 429/500/502/503
 - On permanent failure: logs `EmbeddingError`, returns empty array `[]`
-- Caller handles empty array gracefully (memory is saved without embedding)
+- Supports model upgrade path: change `EMBEDDING_MODEL` env var to switch from `claude-haiku-4.5` → `claude-sonnet-4.6` → `claude-opus-4.6` without code changes
 
 **Codeflow**:
 ```
+class AnthropicProvider implements EmbeddingProvider:
+  name = 'anthropic'
+  client: Anthropic
+  model: string  // from config, default 'claude-haiku-4.5'
+
+  constructor(config):
+    1. this.client = new Anthropic({ apiKey: config.apiKey })
+    2. this.model = config.model || 'claude-haiku-4.5'
+
+  getDimensions(): 1536
+
+  generateEmbedding(text):
+    1. try:
+       return await withRetry(async () => {
+         a. response = await this.client.embeddings.create({
+              model: this.model,
+              input: text
+            })
+         b. return response.data[0].embedding  // number[1536]
+       }, { maxAttempts: 2, delayMs: 1000, retryIf: isRetryableHttpError })
+    2. catch (err):
+       a. logger.error(`[${this.name}] Embedding generation failed (model=${this.model})`, err)
+       b. return []   ← caller handles gracefully
+```
+
+---
+
+#### `src/embedding/providers/openaiProvider.ts`
+
+**Purpose**: Embedding provider implementation using OpenAI models. Serves as fallback/alternative to Anthropic.
+
+**What it does**:
+- Implements `EmbeddingProvider` interface
+- Initializes OpenAI client with `EMBEDDING_API_KEY` from config
+- Uses `EMBEDDING_MODEL` from config (default: `text-embedding-3-small` when provider is `openai`)
+- Calls OpenAI Embeddings API to generate vectors
+- Same retry logic as Anthropic provider: 2 attempts, 1s delay, retryable HTTP errors
+
+**Codeflow**:
+```
+class OpenAIProvider implements EmbeddingProvider:
+  name = 'openai'
+  client: OpenAI
+  model: string  // default 'text-embedding-3-small'
+
+  constructor(config):
+    1. this.client = new OpenAI({ apiKey: config.apiKey })
+    2. this.model = config.model || 'text-embedding-3-small'
+
+  getDimensions():
+    return this.model.includes('large') ? 3072 : 1536
+
+  generateEmbedding(text):
+    1. try:
+       return await withRetry(async () => {
+         a. response = await this.client.embeddings.create({
+              model: this.model,
+              input: text
+            })
+         b. return response.data[0].embedding
+       }, { maxAttempts: 2, delayMs: 1000, retryIf: isRetryableHttpError })
+    2. catch (err):
+       a. logger.error(`[${this.name}] Embedding generation failed (model=${this.model})`, err)
+       b. return []
+```
+
+---
+
+#### `src/embedding/providers/localProvider.ts`
+
+**Purpose**: Embedding provider for local/self-hosted models that expose an OpenAI-compatible API (e.g., Ollama, vLLM, LocalAI, llama.cpp server).
+
+**What it does**:
+- Implements `EmbeddingProvider` interface
+- Initializes OpenAI client with `EMBEDDING_API_KEY` and **custom `baseURL`** from `EMBEDDING_BASE_URL`
+- Uses `EMBEDDING_MODEL` from config (e.g., `nomic-embed-text`, `mxbai-embed-large`)
+- Calls the local server's OpenAI-compatible embeddings endpoint
+- Lower retry count (1 retry) since local servers should be more reliable and respond faster
+- Useful for: air-gapped environments, cost-zero deployments, testing without API keys
+
+**Codeflow**:
+```
+class LocalProvider implements EmbeddingProvider:
+  name = 'local'
+  client: OpenAI   // OpenAI SDK pointed at local server
+  model: string
+
+  constructor(config):
+    1. if (!config.baseUrl) throw new ConfigError('EMBEDDING_BASE_URL required for local provider')
+    2. this.client = new OpenAI({
+         apiKey: config.apiKey || 'not-needed',  // some local servers don't require auth
+         baseURL: config.baseUrl                  // e.g., 'http://localhost:11434/v1'
+       })
+    3. this.model = config.model || 'nomic-embed-text'
+
+  getDimensions(): 768  // varies by model, configurable
+
+  generateEmbedding(text):
+    1. try:
+       return await withRetry(async () => {
+         a. response = await this.client.embeddings.create({
+              model: this.model,
+              input: text
+            })
+         b. return response.data[0].embedding
+       }, { maxAttempts: 2, delayMs: 500, retryIf: isRetryableHttpError })
+    2. catch (err):
+       a. logger.error(`[${this.name}] Embedding generation failed (model=${this.model}, baseUrl=${config.baseUrl})`, err)
+       b. return []
+```
+
+---
+
+#### `src/embedding/embeddingService.ts`
+
+**Purpose**: Factory + singleton that creates the correct embedding provider based on config and exposes `generateEmbedding()` as the single entry point for the rest of the plugin.
+
+**What it does**:
+- Reads `EMBEDDING_PROVIDER`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_BASE_URL` from config
+- Creates the appropriate provider instance based on `EMBEDDING_PROVIDER`:
+  - `'anthropic'` → `AnthropicProvider` (default)
+  - `'openai'` → `OpenAIProvider`
+  - `'local'` → `LocalProvider`
+- Exports `generateEmbedding(text: string): Promise<number[]>` — delegates to the active provider
+- Exports `getProviderInfo(): { name, model, dimensions }` — for health check and startup banner
+- Logs which provider/model is active at startup
+
+**Why this pattern?**: All operation files (`memorySave.ts`, `memorySearch.ts`) import `generateEmbedding` from `embeddingService.ts` — they never import providers directly. Switching from Haiku 4.5 to Sonnet 4.6 is a **config change only** (`EMBEDDING_MODEL=claude-sonnet-4.6`), no code changes required.
+
+**Codeflow**:
+```
+INITIALIZATION:
+  1. provider = config.EMBEDDING_PROVIDER  // 'anthropic' | 'openai' | 'local'
+  2. switch (provider):
+       case 'anthropic': instance = new AnthropicProvider({ apiKey, model })
+       case 'openai':    instance = new OpenAIProvider({ apiKey, model })
+       case 'local':     instance = new LocalProvider({ apiKey, model, baseUrl })
+       default:          throw new ConfigError(`Unknown EMBEDDING_PROVIDER: ${provider}`)
+  3. logger.info(`Embedding provider: ${instance.name}, model: ${model}, dimensions: ${instance.getDimensions()}`)
+
 generateEmbedding(text):
-  1. try:
-     return await withRetry(async () => {
-       a. response = await openai.embeddings.create({
-            model: 'text-embedding-3-small',
-            input: text
-          })
-       b. return response.data[0].embedding  // number[1536]
-     }, { maxAttempts: 2, delayMs: 1000, retryIf: isRetryableHttpError })
-  2. catch (err):
-     a. logger.error('Embedding generation failed', err)
-     b. return []   ← caller handles gracefully
+  1. return instance.generateEmbedding(text)
+
+getProviderInfo():
+  1. return {
+       name: instance.name,
+       model: config.EMBEDDING_MODEL,
+       dimensions: instance.getDimensions()
+     }
+```
+
+**Configuration examples**:
+
+```env
+# === Default: Anthropic Claude Haiku 4.5 (recommended) ===
+EMBEDDING_PROVIDER=anthropic
+EMBEDDING_API_KEY=sk-ant-...
+EMBEDDING_MODEL=claude-haiku-4.5
+
+# === Upgrade to Sonnet 4.6 (config change only) ===
+EMBEDDING_PROVIDER=anthropic
+EMBEDDING_API_KEY=sk-ant-...
+EMBEDDING_MODEL=claude-sonnet-4.6
+
+# === Premium: Opus 4.6 ===
+EMBEDDING_PROVIDER=anthropic
+EMBEDDING_API_KEY=sk-ant-...
+EMBEDDING_MODEL=claude-opus-4.6
+
+# === Fallback: OpenAI ===
+EMBEDDING_PROVIDER=openai
+EMBEDDING_API_KEY=sk-...
+EMBEDDING_MODEL=text-embedding-3-small
+
+# === Local: Ollama (no API cost) ===
+EMBEDDING_PROVIDER=local
+EMBEDDING_API_KEY=not-needed
+EMBEDDING_MODEL=nomic-embed-text
+EMBEDDING_BASE_URL=http://localhost:11434/v1
 ```
 
 ---
@@ -658,6 +865,7 @@ generateEmbedding(text):
 
 **What it does**:
 - This is the **write path** — every memory written by the bot flows through here
+- Imports `generateEmbedding` from `embeddingService.ts` (provider-agnostic)
 - Steps 1–5 are synchronous (awaited in sequence)
 - Step 6 (embedding) is **fire-and-forget** — launched asynchronously, not awaited
 - If PostgreSQL fails (step 1) → the entire operation fails (throws `DatabaseError`)
@@ -727,6 +935,7 @@ generateAndStoreEmbedding(id, tenantId, content):
 
 **What it does**:
 - This is the **read path** — every memory search by the bot flows through here
+- Imports `generateEmbedding` from `embeddingService.ts` (provider-agnostic)
 - Step 1: Normalize query → SHA-256 hash (for cache key)
 - Step 2: Check Redis cache → if HIT, return immediately (~1ms)
 - Step 3: On MISS, generate embedding for the query
@@ -877,7 +1086,8 @@ getHealthStatus():
        tenancy: TENANCY_NAME,  // from config
        status: status,
        postgresql: pgOk ? 'connected' : 'disconnected',
-       redis: redisOk ? 'connected' : 'disconnected'
+       redis: redisOk ? 'connected' : 'disconnected',
+       embedding: getProviderInfo()  // { name: 'anthropic', model: 'claude-haiku-4.5', dimensions: 1536 }
      }
 ```
 
@@ -904,8 +1114,9 @@ INITIALIZATION (runs once on plugin load):
   1. config = loadConfig()                         // fail-fast if env vars invalid
   2. await initPool(config.DATABASE_URL)           // create PG pool + register pgvector
   3. await connectRedis(config.REDIS_URL)          // connect ioredis
-  4. await loadDictionaries()                      // load en_US + vi_VN Hunspell
-  5. logger.info(`memory-pgvector-redis@${version} initialized — tenancy=${config.TENANCY_NAME}, table=${config.DB_TABLE_NAME}`)
+  4. initEmbeddingService(config)                  // create provider: anthropic/openai/local
+  5. await loadDictionaries()                      // load en_US + vi_VN Hunspell
+  6. logger.info(`memory-pgvector-redis@${version} initialized — tenancy=${config.TENANCY_NAME}, table=${config.DB_TABLE_NAME}, embedding=${getProviderInfo().name}/${getProviderInfo().model}`)
 
 GRACEFUL SHUTDOWN:
   process.on('SIGTERM', shutdown)
@@ -1067,7 +1278,7 @@ EXPORTS:
 | **PG Pool** (`pool.ts`) | Exponential backoff reconnect | Degraded health. Operations throw `DatabaseError`. |
 | **PG Query** (`queries.ts` → `pool.ts`) | Per-query retry (2×, 500ms) | Non-transient → immediate `DatabaseError` |
 | **Redis** (`cacheService.ts`) | Every method try/catch → return `null` | ⚠️ Fail-open: log + return null → fall through to PG |
-| **Embedding** (`openaiEmbedding.ts`) | HTTP retry (2×, 1s) | ⚠️ Return `[]` → memory saved without vector |
+| **Embedding** (`embeddingService.ts`) | HTTP retry (2×, 1s) per provider | ⚠️ Return `[]` → memory saved without vector |
 | **Normalization** (`pipeline.ts`) | try/catch → fallback to raw SHA-256 | ⚠️ Cache key may differ, PG search still works |
 | **memory_save** | Step-by-step try/catch | PG fail = throw. Redis/embedding = log + continue |
 | **memory_search** | Step-by-step try/catch | Redis fail = skip cache. Embedding fail = empty results |
@@ -1086,7 +1297,8 @@ EXPORTS:
 | `pg` | `^8.x` | PostgreSQL client with Pool |
 | `pgvector` | `^0.2.x` | Register vector type with pg |
 | `ioredis` | `^5.x` | Redis client with reconnect |
-| `openai` | `^4.x` | OpenAI SDK for embeddings |
+| `@anthropic-ai/sdk` | `^0.52.x` | Anthropic SDK — default embedding provider (Haiku 4.5, Sonnet 4.6, Opus 4.6) |
+| `openai` | `^4.x` | OpenAI SDK — alternative embedding provider + local provider (OpenAI-compatible API) |
 | `nspell` | `^4.x` | Hunspell spell checker |
 | `dictionary-en` | `^4.x` | English dictionary for nspell |
 | `dotenv` | `^16.x` | Load .env file |
