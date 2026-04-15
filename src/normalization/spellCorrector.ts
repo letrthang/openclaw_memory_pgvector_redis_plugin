@@ -18,13 +18,7 @@ export async function loadDictionaries(): Promise<void> {
     // Load English dictionary
     // dictionary-en v4+ exports a promise-like default that resolves to { aff, dic }
     const enModule = await import('dictionary-en');
-    const enData = typeof enModule.default === 'function'
-      ? await new Promise<{ aff: Buffer; dic: Buffer }>((resolve, reject) =>
-          enModule.default((err: Error | null, result: { aff: Buffer; dic: Buffer }) =>
-            err ? reject(err) : resolve(result)
-          )
-        )
-      : await enModule.default;
+    const enData = await enModule.default;
     enSpell = nspell(enData.aff, enData.dic);
 
     // Load Vietnamese dictionary (bundled files)
